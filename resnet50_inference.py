@@ -20,7 +20,8 @@ transform = weights.transforms()
 
 testset = torchvision.datasets.CIFAR10(root= work_dir+'/dataset', train=False, download=True, transform=transform)
 testloader = torch.utils.data.DataLoader(testset, batch_size=1, shuffle=False, num_workers=16)
-model = torch.load(work_dir+'/weights/resnet50.pth')
+# model = torch.load(work_dir+'/weights/resnet50.pth')
+model = models.resnet50(weights=None)
 # cuda
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -46,9 +47,10 @@ for _ in range(iteration_num):
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+            break
 
 print(f'original model, inference time usage: {total_time/iteration_num}, accuracy: {100 * correct / total} %')
 print(f'average time: {np.mean(time_record)}, time variance: {np.var(time_record)}')
 print(f'ignoring warm up time, average time: {np.mean(time_record[1:])}, time variance: {np.var(time_record[1:])}')
 
-pickle.dump(time_record, open('./resnet50 inference time.pkl', 'wb'))
+# pickle.dump(time_record, open('./resnet50 inference time.pkl', 'wb'))

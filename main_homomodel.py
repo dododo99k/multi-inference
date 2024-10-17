@@ -2,12 +2,14 @@ import time,copy,os,pickle,argparse,random,math,shutil,queue,tqdm
 from torch.multiprocessing import Pool, Manager, current_process
 import numpy as np
 
-# import matplotlib
-# matplotlib.use("agg")
+import matplotlib
+matplotlib.use("agg")
 import matplotlib.pyplot as plt
 
-
 import torch
+
+# import ee models
+from ee_models import *
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -61,12 +63,18 @@ from torchvision.io import read_image
 from torchvision.models import resnet50, ResNet50_Weights, resnet101, ResNet101_Weights
 
 def load_official_model_dataset():
+
+    work_dir = os.getcwd()
+
     img = read_image("Grace_Hopper.jpg")
 
     # Step 1: Initialize model with the best available weights
-    weights = ResNet101_Weights.DEFAULT
-    model = resnet101(weights=weights)
+    weights = ResNet50_Weights.DEFAULT
+    preprocess = weights.transforms()
+
+    model = torch.load(work_dir+'/weights/resnet50_EE.pth')
     model.eval()
+    model.train_mode = False
 
     # Step 2: Initialize the inference transforms
     preprocess = weights.transforms()
@@ -92,6 +100,7 @@ def duplicate_model_dataset(model, dataset, num_proc):
         mdl = copy.deepcopy(model)
         mdl.to(device)
         mdl.eval()
+        mdl.train_mode = False
         models.append(mdl)
 
         data = copy.deepcopy(dataset)
@@ -101,20 +110,23 @@ def duplicate_model_dataset(model, dataset, num_proc):
     return models, datasets
 
 # Persistent worker function: Retrieves a task from the queue and processes it
-def worker(execute_queue, finish_queue, model, dataset):
+def worker(execute_queue, finish_queue, model, dataset, ramp_id = None):
     print(f"entered {current_process().name}. waiting for tasks...", flush=True)
     data = dataset.to(device)
     while True:
         # Blocking call, waits until an item is available in the queue
         task = execute_queue.get()  # Blocks indefinitely until a task is available
-        
+        # print(f'debug, task: {task.tid}, process: {current_process().name} ')
         if task is None:  # None is the signal to stop the worker
             print(f"{current_process().name} received stop signal.")
             break
 
         task.start_time = time.perf_counter()
 
-        model(data).detach().cpu() # .numpy().argmax() # model.eval() is already set, here to device is still needed, TODO XXX
+        outputs = model(data, ramp_id)
+        # print(f'get results, task: {task.tid}')
+        output = outputs[0]
+        output.detach().cpu()# .numpy().argmax() # model.eval() is already set, here to device is still needed, TODO XXX
         # print(f"{current_process().name} process finish task: {task.tid}")
         task.finish_time = time.perf_counter()
 
@@ -147,6 +159,7 @@ if __name__ == "__main__":
                            type = float,
                            default=0.4,
                            help='poisson density for user inference request number per ms')
+    
     argparser.add_argument('-pn','--process_number',
                            type = int,
                            default=4,
@@ -162,13 +175,14 @@ if __name__ == "__main__":
     #                        )
     
     args = argparser.parse_args()
-
+    
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.multiprocessing.set_start_method('spawn')
-    num_proc = 24
+    num_proc = 12
     tid = 0
     sim_interval = 1 #ms
+    ramp_id = 12
     # total_tasks = []
 
     # model_name = 'resnet50' # or resnet101
@@ -190,10 +204,10 @@ if __name__ == "__main__":
         pool = Pool(processes=num_proc)
 
         # pool.starmap(run_task, [(model, dataset) for dataset in datasets for model in models])
-
+        
         # Start worker processes to process tasks in the queue
-        for i in range(num_proc):  
-            pool.apply_async(worker, args=(execute_queue, finish_queue, models[i], datasets[i])) # workers see execute_queue, not buffer_queue
+        for i in range(num_proc):
+            pool.apply_async(worker, args=(execute_queue, finish_queue, models[i], datasets[i], ramp_id)) # workers see execute_queue, not buffer_queue
 
         time.sleep(10) # sleep to wait worker process to start
         start_time = time.perf_counter()
@@ -225,11 +239,18 @@ if __name__ == "__main__":
         
         serving_inference_time = time.perf_counter() - start_time
         print('inference runtime usage:', serving_inference_time)
+        pass
+        # wait for empty execute queue
+        while not execute_queue.empty():
+            continue
 
         ###### post processing (XXX this needs to be done here, if the manager() done, then queue are cleared) ######
         results = {}
+        print('finish tasks')
+        
         while not finish_queue.empty():
             task = finish_queue.get()
+            # task = task_list[0]
             results[str(task.tid)] = copy.deepcopy(task)
 
         # When you're ready to stop the workers, send None into the queue for each worker
@@ -242,7 +263,7 @@ if __name__ == "__main__":
         print("All tasks processed and workers stopped.")
 
 
-    pickle.dump(results, open(f'./homomodel_result/results_{args.intensity}_{num_proc}.pkl','wb'))
+    pickle.dump(results, open(f'./homomodel_result/results_{ramp_id}_{args.intensity}_{num_proc}.pkl','wb'))
 
     total_time = time.perf_counter() - start_time
     print('time usage:', total_time)
@@ -250,16 +271,21 @@ if __name__ == "__main__":
 
     ##### plot figure #######
     # results = pickle.load(open('results.pkl','rb'))
-    queue_times = [r.queue_time for r in results.values()]
-    infer_times = [r.infer_time for r in results.values()]
+    queue_times = [float(r.queue_time) for r in results.values()]
+    infer_times = [float(r.infer_time) for r in results.values()]
+    for i in range(999,-1,-1):
+        if queue_times[i]> 0.05:
+            break
+
     pass
     # plt.switch_backend('agg')
-    plt.plot(queue_times, label='Queue Times')
-    plt.plot(infer_times, label='Inference Times') #;plt.show()
+    plt.plot(queue_times[i:], label='Queue Times')
+    plt.plot(infer_times[i:], label='Inference Times') #;plt.show()
     plt.legend()
     plt.xlabel('Index')
+    # plt.yticks(np.arange(0,0.15, 0.01))
     plt.ylabel('Time')
     # fname = f'{args.intensity}_{num_proc}.jpg'
-    plt.savefig(f'./homomodel_result/{args.intensity}_{num_proc}.jpg')
+    plt.savefig(f'./homomodel_result/{ramp_id}_{args.intensity}_{num_proc}.jpg')
     plt.close()
     # plt.show()
