@@ -14,7 +14,7 @@ from ee_models import *
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 class Task():
-    def __init__(self, tid=-1, arrive_time = -1, start_time = -1, finish_time = -1):
+    def __init__(self, tid=-1, arrive_time = -1, start_time = -1, finish_time = -1, warmup = False):
         # self.model_name = model_name
         self.tid = tid
         self.arrive_time = arrive_time
@@ -22,6 +22,7 @@ class Task():
         self.finish_time = finish_time
         self.infer_time = -1
         self.queue_time = -1
+        self.warmup_task = warmup
 
     def finalize(self, if_print=True):
         self.infer_time = self.finish_time - self.start_time
@@ -132,7 +133,8 @@ def worker(execute_queue, finish_queue, model, dataset, ramp_id = None):
 
         task.finalize(if_print=False)
 
-        finish_queue.put(task) # put it into the finish queue for stats and analysis later
+        if not task.warmup_task:
+            finish_queue.put(task) # put it into the finish queue for stats and analysis later
 
 def schedule(buffer_queue, execute_queue):
     # this scheduling action happens for all time intervals, if not action needs to be done, then basically skip
@@ -157,7 +159,7 @@ if __name__ == "__main__":
     
     argparser.add_argument('-pd','--intensity',
                            type = float,
-                           default=0.4,
+                           default=0.5,
                            help='poisson density for user inference request number per ms')
     
     argparser.add_argument('-pn','--process_number',
@@ -169,6 +171,11 @@ if __name__ == "__main__":
                            type = int,
                            default=30000,
                            help='time duration in ms')
+    
+    argparser.add_argument('-pr','--num_process',
+                           type = int,
+                           default=5,
+                           help='time duration in ms')
     # argparser.add_argument('-ml','--model_list',
     #                        type = list,
     #                        default= ['resnet50'] # ,'resnet101',
@@ -179,10 +186,10 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.multiprocessing.set_start_method('spawn')
-    num_proc = 12
+    num_proc = args.num_process
     tid = 0
     sim_interval = 1 #ms
-    ramp_id = 12
+    ramp_id = None
     # total_tasks = []
 
     # model_name = 'resnet50' # or resnet101
@@ -208,8 +215,17 @@ if __name__ == "__main__":
         # Start worker processes to process tasks in the queue
         for i in range(num_proc):
             pool.apply_async(worker, args=(execute_queue, finish_queue, models[i], datasets[i], ramp_id)) # workers see execute_queue, not buffer_queue
+        
+        warmup_tasks = 100*num_proc
+        for i in range(warmup_tasks):
+            task = Task(tid=-1, arrive_time=time.perf_counter(), warmup = True)
+            execute_queue.put(task)
 
+        # wait for finsihing all warmup tasks
+        while not execute_queue.empty():
+            continue
         time.sleep(10) # sleep to wait worker process to start
+
         start_time = time.perf_counter()
 
         # main loop to receive tasks
@@ -273,15 +289,16 @@ if __name__ == "__main__":
     # results = pickle.load(open('results.pkl','rb'))
     queue_times = [float(r.queue_time) for r in results.values()]
     infer_times = [float(r.infer_time) for r in results.values()]
-    for i in range(999,-1,-1):
-        if queue_times[i]> 0.05:
-            break
+    # for i in range(999,-1,-1):
+    #     if queue_times[i]> 0.05:
+    #         break
 
     pass
     # plt.switch_backend('agg')
-    plt.plot(queue_times[i:], label='Queue Times')
-    plt.plot(infer_times[i:], label='Inference Times') #;plt.show()
+    plt.plot(queue_times, label='Queue Times')
+    plt.plot(infer_times, label='Inference Times') #;plt.show()
     plt.legend()
+    plt.ylim(0,0.02)
     plt.xlabel('Index')
     # plt.yticks(np.arange(0,0.15, 0.01))
     plt.ylabel('Time')
