@@ -1,7 +1,6 @@
 import time,copy,os,pickle,argparse,random,math,shutil,queue,tqdm
 from torch.multiprocessing import Pool, Manager, current_process
 import numpy as np
-
 import matplotlib
 matplotlib.use("agg")
 import matplotlib.pyplot as plt
@@ -67,12 +66,13 @@ def load_official_model_dataset():
 
     work_dir = os.getcwd()
 
-    img = read_image("Grace_Hopper.jpg")
+    img = torch.rand(3, 64, 64)
 
     # Step 1: Initialize model with the best available weights
     weights = ResNet50_Weights.DEFAULT
     preprocess = weights.transforms()
-
+    
+    # by default, all are resnet50
     model = torch.load(work_dir+'/weights/resnet50_EE.pth')
     model.eval()
     model.train_mode = False

@@ -1,7 +1,7 @@
 import time,copy,os,pickle, argparse,json, subprocess
 import numpy as np
 import torch
-from torch.multiprocessing import Manager, Pool, Barrier, current_process
+from torch.multiprocessing import Manager, Pool,current_process
 from torchvision import models
 
 
@@ -23,7 +23,6 @@ def duplicate_model_dataset(model, dataset, num_proc):
     return models, datasets
 
 def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0):
-    print(f'{current_process().name} starting with {len(idx_list)} tasks')
     # Child process: set device mapping for MPS. Expect CUDA_VISIBLE_DEVICES to be set externally (e.g., to '1').
     os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
     # Robust device selection; fallback to CPU if CUDA is unavailable/problematic
@@ -45,14 +44,14 @@ def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0
                     torch.cuda.synchronize()
                 _ = _out.detach().cpu()
 
-    # Wait at the barrier so all workers begin inference together
+    # Mark readiness and wait for global start event
+    print(f"{current_process().name} ready; waiting for start_barrier ...")
+
     try:
-        print(f"{current_process().name} reached barrier; waiting...")
-        start_barrier.wait(timeout=120)
-        print(f"{current_process().name} passed barrier; starting inference")
+        start_barrier.wait()
     except Exception as e:
-        print(f"{current_process().name} barrier wait failed: {e}")
-    
+        print(f"Error occurred while waiting for barrier: {e}") 
+        
     worker_start_time = time.perf_counter()
     for idx in idx_list:
         with torch.no_grad():
@@ -104,7 +103,7 @@ if __name__ == "__main__":
                            help='batch size for each inference subprocess')
     argparser.add_argument('-w','--warmup',
                            type = int,
-                           default=0,
+                           default=100,
                            help='warmup iterations per worker before timing loop')
     
     args = argparser.parse_args()
@@ -159,8 +158,10 @@ if __name__ == "__main__":
     # shared records across processes (per-worker)
     manager = Manager()
     pool = Pool(processes=args.parallel)
-    start_barrier = Barrier(args.parallel+1)
-    
+    # Use manager-backed proxies so objects are pickleable under spawn
+
+    start_barrier = manager.Barrier(args.parallel+1)
+
     worker_records = [manager.list() for _ in range(args.parallel)]
 
     # partition indices across the number of parallel workers dynamically
@@ -171,29 +172,33 @@ if __name__ == "__main__":
     # Use explicit spawn context for both Pool and Barrier to avoid cross-context sync issues
     # ctx =  torch.multiprocessing.get_context('spawn')
     # pool = ctx.Pool(processes=args.parallel)
-    # start_barrier = ctx.Barrier(args.parallel + 1)
+    # barrier deprecated: using Event + counter instead
 
+    async_results = []
 
     for i in range(args.parallel):
-        pool.apply_async(
+        ar = pool.apply_async(
             parallel_worker,
             args=(models[i], datasets[i], worker_records[i], group_inference_index[i], start_barrier, args.warmup),
         )
-    print('waiting for workers to start...')
-    time.sleep(5)
+        async_results.append(ar)
 
 
-    # Main enters barrier last to start all workers simultaneously
-    print('Main waiting at barrier to start all workers ...')
+    # Wait until all workers report readiness, then release together
+    print('Waiting for workers to be ready ...')
     try:
-        print('Main reached barrier; releasing all when ready ...')
-        start_barrier.wait(timeout=120)
-        print('All workers released to start inference')
+        start_barrier.wait(timeout=60)  # 1 min timeout
+        print('All workers ready; starting inference ...')
     except Exception as e:
-        print(f'Barrier in main failed: {e}')
+        print(f'Error or timeout while waiting for workers to be ready: {e}')
 
     # Close and join the pool to wait for workers to finish
     pool.close() 
+    for i, ar in enumerate(async_results):
+            try:
+                ar.get()
+            except Exception as e:
+                print(f"Worker {i} raised: {e}")
     pool.join() 
 
     # Build time_record from merged per-worker task records
@@ -240,8 +245,8 @@ if __name__ == "__main__":
                 'count': int(len(time_record)),
                 'mean_ms': mean_ms,
                 'std_ms': std_ms,
-                'start_time': float(ordered[0]['start']),
-                'end_time': float(ordered[-1]['end']),
+                'start_time': float(ordered[0]['start'] if ordered else 0.0),
+                'end_time': float(ordered[-1]['end'] if ordered else 0.0),
             },
             'time_record_s': time_record,  # durations in seconds
             'tasks': ordered if 'ordered' in locals() else [],
