@@ -22,7 +22,8 @@ def duplicate_model_dataset(model, dataset, num_proc):
 
     return models, datasets
 
-def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0):
+def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0,
+                    enable_compile=False, compile_mode='max-autotune'):
     # Child process: set device mapping for MPS. Expect CUDA_VISIBLE_DEVICES to be set externally (e.g., to '1').
     os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
     # Robust device selection; fallback to CPU if CUDA is unavailable/problematic
@@ -34,6 +35,17 @@ def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0
     print(f'{current_process().name} using device {dev}')
     
     model = model.to(dev).eval()
+
+    # Optionally compile the model for acceleration (PyTorch 2+)
+    if enable_compile and hasattr(torch, 'compile'):
+        try:
+            kwargs = {}
+            if compile_mode:
+                kwargs['mode'] = compile_mode
+            model = torch.compile(model, **kwargs)
+            print(f"{current_process().name} compiled model with torch.compile (mode={compile_mode})")
+        except Exception as e:
+            print(f"{current_process().name} torch.compile failed ({e}); falling back to eager mode")
     data = data.to(dev, non_blocking=True) if dev.type == 'cuda' else data
 
     if warmup > 0:
@@ -105,6 +117,17 @@ if __name__ == "__main__":
                            type = int,
                            default=100,
                            help='warmup iterations per worker before timing loop')
+    argparser.add_argument('-nc','--no-compile',
+                           action='store_true',
+                           help='disable torch.compile acceleration (PyTorch 2+)')
+    argparser.add_argument('--compile-mode',
+                           type=str,
+                           default='max-autotune',
+                           help="torch.compile mode: 'default', 'reduce-overhead', or 'max-autotune'")
+    # argparser.add_argument('--compile-backend',
+    #                        type=str,
+    #                        default=None,
+    #                        help="torch.compile backend (e.g., 'inductor'); None uses default")
     
     args = argparser.parse_args()
 
@@ -175,11 +198,12 @@ if __name__ == "__main__":
     # barrier deprecated: using Event + counter instead
 
     async_results = []
-
+    print(f'[DEBUG]: {args.no_compile}, {args.compile_mode}')
     for i in range(args.parallel):
         ar = pool.apply_async(
             parallel_worker,
-            args=(models[i], datasets[i], worker_records[i], group_inference_index[i], start_barrier, args.warmup),
+            args=(models[i], datasets[i], worker_records[i], group_inference_index[i], start_barrier, args.warmup,
+                  not args.no_compile, args.compile_mode),
         )
         async_results.append(ar)
 
@@ -187,7 +211,7 @@ if __name__ == "__main__":
     # Wait until all workers report readiness, then release together
     print('Waiting for workers to be ready ...')
     try:
-        start_barrier.wait(timeout=60)  # 1 min timeout
+        start_barrier.wait(timeout=600)  # 1 min timeout
         print('All workers ready; starting inference ...')
     except Exception as e:
         print(f'Error or timeout while waiting for workers to be ready: {e}')
@@ -240,6 +264,9 @@ if __name__ == "__main__":
                 'seed': int(args.seed),
                 'device': str(device),
                 'backend': 'torch',
+                'compile': bool(not args.no_compile),
+                'compile_mode': args.compile_mode,
+                # 'compile_backend': args.compile_backend,
             },
             'summary': {
                 'count': int(len(time_record)),
