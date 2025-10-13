@@ -12,4 +12,4 @@ echo quit | nvidia-cuda-mps-control || true
 rm -rf /tmp/nvidia-mps 2>/dev/null || true
 
 # 恢复 PowerMizer（需要 nvidia-settings 可用）
-nvidia-settings -a "[gpu:0]/GPUPowerMizerMode=0" || true   # 0=Adaptive
+# nvidia-settings -a "[gpu:0]/GPUPowerMizerMode=0" || true   # 0=Adaptive
