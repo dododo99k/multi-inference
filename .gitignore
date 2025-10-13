@@ -1,5 +1,5 @@
-/weights/
-/profile*/   # Ignore all profile directories
+weights/
+profile_results*/   # Ignore all profile directories
 
 
 *pth
