@@ -1,11 +1,12 @@
 import time,copy,os,pickle,argparse,random,math,shutil,queue,tqdm
-from torch.multiprocessing import Pool, Manager, current_process
+from collections import deque
+from torch.multiprocessing import Pool,Process, Semaphore, Event, Manager, Value, Queue, current_process
 import numpy as np
 import matplotlib
 matplotlib.use("agg")
 import matplotlib.pyplot as plt
 import torch
-from functions import Task
+from functions import Task, FastRollingWindow, InferenceRecord
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -59,88 +60,122 @@ def load_offical_models_datasets():
 
 
 # Persistent worker function: Retrieves a task from the queue and processes it
-def worker(execute_queue, finish_queue, model, dataset):
-    print(f"entered {current_process().name}. waiting for tasks...", flush=True)
-    data = dataset.to(device)
+def batch_worker(model, execute_queue, permit, done, stop, shared_mem_list, data_number):
+    # permit: Semaphore to control access to the shared memory
+    # done: Event to signal that processing is done
+    # stop: Event to signal that processing should stop
+    # shared_mem_list: shared memory tensor to read data from
+    # data_number: Value to indicate the number of data items in shared memory
+    os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
+    # Robust device selection; fallback to CPU if CUDA is unavailable/problematic
+    try:
+        torch.cuda.set_device(0)
+        dev = torch.device('cuda:0')
+    except Exception:
+        dev = torch.device('cpu')
+    model = model.to(dev).eval()
+
+    print(f"entered batch {current_process().name}. waiting for tasks...", flush=True)
+    # warm up
+    data = shared_mem_list[:10].to(dev)
+    for _ in range(100):
+        _ = model(data)
 
     while True:
-        # Blocking call, waits until an item is available in the queue
-        task = execute_queue.get()  # Blocks indefinitely until a task is available
-        # print(f'debug, task: {task.tid}, process: {current_process().name} ')
-        if task is None:  # None is the signal to stop the worker
-            print(f"{current_process().name} received stop signal.")
+        permit.wait()           # 阻塞等待许可（不占 CPU）
+        if stop.is_set():          # 允许优雅收尾
             break
-
-        task.start_time = time.perf_counter()
-
-        outputs = model(data)
-
-        outputs.detach().cpu()
-        # print(f"{current_process().name} process finish task: {task.tid}")
-        task.finish_time = time.perf_counter()
-
-        task.finalize(if_print=False)
-
-        finish_queue.put(task) # put it into the finish queue for stats and analysis later
-
-# Persistent worker function: Retrieves a task from the queue and processes it
-def batch_worker(execute_queue, finish_queue, model, dataset):
-    print(f"entered batch {current_process().name}. waiting for tasks...", flush=True)
-    data = dataset.to(device)
-    data = data.repeat(128, 1, 1, 1) # repeat this task, as all tasks are the same data
-
-    while True: 
-        # Blocking call, waits until an item is available in the queue
-        if_ending = False
-        count = 1
-        tasks = []
-
-        task = execute_queue.get() # Blocks indefinitely until a task is available
-        tasks.append(task)
-
-        while not execute_queue.empty():
-            task = execute_queue.get()
-            
-            # print(f'debug, task: {task.tid}, process: {current_process().name} ')
-            if task is None:  # None is the signal to stop the worker
-                if_ending = True
-                break
-            else:
-                tasks.append(task)
-                count += 1
-    
-        if if_ending or task is None: 
-            print(f"{current_process().name} received stop signal.")
-            break
-
-        for t in tasks: 
-            t.start_time = time.perf_counter()
-            t.batchsize = count # update its batchsize used during inference
-
-        outputs = model(data[:count])
-
-        outputs.detach().cpu()
-        # print(f"{current_process().name} process finish task: {task.tid}")
+        data = shared_mem_list[:data_number.value].to(dev)
+        data_number.value = 0      # 重置数据计数器
+        results = model(data)
+        results.detach().cpu()     # 释放许可，通知主进程批处理已完成
+        finish_time_temp = time.time_ns() / 1_000_000
         
-        for t in tasks:
-            t.finish_time = time.perf_counter()
+        tmp = []
+        while True:
+            try:
+                task = execute_queue.get_nowait()
+            except queue.Empty:
+                break
+            task.finish_time = finish_time_temp
+            tmp.append(task)
+        for task in tmp:
+            execute_queue.put(task)
+        
+        permit.clear()            # 重置许可，等待下一批数据
+        done.set()
 
-            t.finalize(if_print=False)
 
-            finish_queue.put(t) # put it into the finish queue for stats and analysis later
+# Scheduler with history info
+class Scheduler():
+    def __init__(self, num_proc, buffer_queues, execute_queues, finish_queues, shared_mem_lists, shared_mem_indexs, permits, dones, stop):
+        self.num_proc = num_proc
+        self.buffer_queues = buffer_queues
+        self.execute_queues = execute_queues
+        self.finish_queues = finish_queues
+        self.shared_mem_lists = shared_mem_lists
+        self.shared_mem_indexs = shared_mem_indexs
+        self.permits = permits
+        self.dones = dones
+        self.stop = stop
+        # self.finish_times = finish_times
+        
+        self.time = 0
+        self.running_inference = {}
 
-
-def schedule(num_proc, buffer_queues, execute_queues):
-    # this scheduling action happens for all time intervals, if not action needs to be done, then basically skip
+    def simple_schedule(self, num_proc, buffer_queues, execute_queues):
+        for proc in range(num_proc): # for each proc
+            if len(buffer_queues[proc]) == 0:
+                pass
+            else:
+                task = buffer_queues[proc].popleft()
+                execute_queues[proc].append(task)
     
-    for proc in range(num_proc): # for each proc
+    def schedule(self):
+        # this scheduling action happens for all time intervals, if not action needs to be done, then basically skip
+        self.time += 1
+        for model_idx, permit in enumerate(self.permits):
+            if permit.is_set(): # some worker is still busy
+                continue
+            
+        pass
+        # if decide to allocate tasks to GPU, then call put_tasks_into_gpu()
+        
+        self.put_tasks_into_gpu(model_idx)
 
-        if buffer_queues[proc].empty():
-            pass
-        else:
-            task = buffer_queues[proc].get()
-            execute_queues[proc].put(task)
+    def put_tasks_into_gpu(self, model_idx):
+        buffer_queue = self.buffer_queues[model_idx]
+        execute_queue = self.execute_queues[model_idx]
+        shared_mem = self.shared_mem_lists[model_idx]
+        shared_mem_index = self.shared_mem_indexs[model_idx]
 
+        while not len(buffer_queue) == 0:
+            task = buffer_queue.popleft()
+            # put data into shared memory
+            shared_mem[shared_mem_index.value].copy_(task.input_data.squeeze(0))
+            shared_mem_index.value += 1
+            execute_queue.append(task)
+        self.permits[model_idx].set()  # notify the worker to start processing
+    
+    def finish_tasks_from_gpu(self):
+        # see which model has finished its batch processing
+        for model_idx, done in enumerate(self.dones):
+            if done.is_set():
+                # read finished tasks from execute queue and put into finish queue
+                execute_queue = self.execute_queues[model_idx]
+                finish_queue = self.finish_queues[model_idx]
+                while not len(execute_queue) == 0:
+                    task = execute_queue.popleft()
+                    finish_queue.append(task)
+                # clear done event
+                self.permits[model_idx].clear() # extra clear for safety
+                done.clear()
+    
+    def stop_all(self):
+        for permit in self.permits: 
+            permit.set()
+        self.stop.set()
+        
 
 #### TODO XXX
 #### increase the arrival interval, does not have to be 1ms granularity
@@ -178,8 +213,8 @@ if __name__ == "__main__":
     # load models and weights and datasets from PyTorch offical achieve
     models, datasets = load_offical_models_datasets()
     num_proc = len(models)
-    tid = 0
-    sim_interval = 1 #ms
+    tkid = 0
+    sim_interval = 1/1000 #ms
     # total_tasks = []
 
     # generate traffic 
@@ -187,101 +222,125 @@ if __name__ == "__main__":
     print('generated totally', sum(traffic), 'tasks')
 
     # Create a manager to manage shared data
-    with Manager() as manager:
-        print('entering the manager')
 
-        # Shared queue (per model) managed by the manager
-        buffer_queues, execute_queues, finish_queues = [], [], []
-        for q in range(num_proc):
-            buffer_queue = manager.Queue() # this queue is to buffer all the incoming tasks, before they are sent to execute_queue, the scheduler mainly schedule this queue
-            execute_queue = manager.Queue() # this queue is to send tasks to workers, XXX once task is put, workers will immediately get it to execute XXX
-            finish_queue = manager.Queue() # this queue is to collect stats
-            buffer_queues.append(buffer_queue)
-            execute_queues.append(execute_queue)
-            finish_queues.append(finish_queue)
 
-        # Create a persistent pool of worker processes 
-        pool = Pool(processes=num_proc)
+    # Shared queue (per model) managed by the manager
+    buffer_queues = [deque() for _ in range(num_proc)] # this queue is to buffer all the incoming tasks, before they are sent to execute_queue, the scheduler mainly schedule this queue
+    execute_queues = [Queue() for _ in range(num_proc)] # this multiprocessing queue is to send tasks to workers, XXX once task is put, workers will immediately get it to execute XXX
+    finish_queues = [deque() for _ in range(num_proc)] # this queue is to collect stats
 
-        # pool.starmap(run_task, [(model, dataset) for dataset in datasets for model in models])
+    shared_mem_lists = [torch.empty(10, 3, 224, 224).share_memory_() for _ in range(num_proc)]
+    shared_mem_indexs = [Value('i', 0) for _ in range(num_proc)] # indicate the current index to write new data
+    permits = [Semaphore(1) for _ in range(num_proc)]
+    permits = [Event() for _ in range(num_proc)]  
+    dones = [Event() for _ in range(num_proc)]
+    stop = Event()
+
+    scheduler = Scheduler(num_proc, buffer_queues, execute_queues, finish_queues, shared_mem_lists, shared_mem_indexs, permits, dones, stop)
+    # finish_times = [Value('d', 0.0) for _ in range(num_proc)] # store finish time of each batch worker
+    
+    
+    # Start worker processes to process tasks in the queue
+    torch_processes = []
+    for i in range(num_proc):
+        # if args.batch:
+        #     pool.apply_async(batch_worker, args=(execute_queues[i], finish_queues[i], models[i], datasets[i])) # workers see execute_queue, not buffer_queue
+        # else:
+        #     pool.apply_async(worker, args=(execute_queues[i], finish_queues[i], models[i], datasets[i])) # workers see execute_queue, not buffer_queue
+        p = Process(
+                target=batch_worker,
+                args=(models[i], execute_queues[i], permits[i], dones[i], stop, shared_mem_lists[i], shared_mem_indexs[i]),
+                name=f'Worker-{i}'
+            )
+        p.start()
+        torch_processes.append(p)
         
-        # Start worker processes to process tasks in the queue
-        for i in range(num_proc):
-            if args.batch:
-                pool.apply_async(batch_worker, args=(execute_queues[i], finish_queues[i], models[i], datasets[i])) # workers see execute_queue, not buffer_queue
-            else:
-                pool.apply_async(worker, args=(execute_queues[i], finish_queues[i], models[i], datasets[i])) # workers see execute_queue, not buffer_queue
+    # wait for workers to start
+    print('waiting for workers to start and warm up...')
+    time.sleep(5)
 
-        # wait for workers to start
-        print('waiting for workers to start...')
-        time.sleep(5)
-
-        start_time = time.perf_counter()
-        print('starting the main loop...')
-        # main loop to receive tasks
-        for t in range(args.duration):
-            loop_start_time = time.perf_counter()
-
-            for i in range(traffic[t]):
-                
-                # random request for a model
-                idx = np.random.randint(num_proc)
-
-                task = Task(model_id=idx, tid=tid, arrive_time=time.perf_counter())
-                # print(task.tid, task.arrive_time)
-                buffer_queues[idx].put(task) # always put into the buffer queue
-
-                ## XXX main scheduling here XXX #######
-                schedule(num_proc, buffer_queues, execute_queues) # TODO this is a native scheduler, TBD
-
-                tid += 1 # increas task id
-
-            # this control the traffic arrival at real-world time
-            elapsed = time.perf_counter() - loop_start_time
-            # if elapsed >= 0.001: print('warning, time slot beyond defined unit, time is ', elapsed)
-            # while elapsed < 0.001:
-            #     elapsed = time.perf_counter() - loop_start_time
-            if elapsed < 0.001: # interval is 1ms
-                time.sleep(0.001 - elapsed)
-            else:
-                # print('warning, time slot beyond defined unit, time is ', elapsed)
-                print('.', end='', flush=True)
-
+    # start_time = time.perf_counter()
+    print('starting the main loop...')
+    
+    #########################
+    # generate tasks ahead of simulation
+    #########################
+    tasks_list = [] # store tasks at each time slot, length should be args.duration
+    task_num_per_model_lists = [] # store how many tasks for each model at each time slot
+    for t in range(args.duration):
+        temp = []
+        task_num_per_model_temp = [0]*num_proc
+        for i in range(traffic[t]):
+            idx = np.random.randint(num_proc)
+            task_num_per_model_temp[idx] += 1
+            task = Task(model_id=idx, tk_id=tkid)
+            tkid += 1 # increas task id
+            temp.append(task)
+        tasks_list.append(temp)
+        task_num_per_model_lists.append(task_num_per_model_temp)
+    #########################
+    # main loop to receive tasks
+    #########################
+    base_time = time.time_ns() 
+    for t in range(args.duration):
+        loop_start_time = time.perf_counter()
         
-        # wait for tasks to complete
-        print('wait for 5 seconds...')
-        time.sleep(5)
-        # wait for empty execute queue
-        while True:
-            empty_all = True
-            for execute_queue in execute_queues:
-                empty_all = empty_all and execute_queue.empty()
-            if empty_all: break
-            print('wait for 1 more second...')
-            time.sleep(1)
+        task_num_per_model = task_num_per_model_lists[t] # how many tasks for each model at current time slot
+        # put tasks into buffer queues
+        for task in tasks_list[t]:
+            task.arrive_time = (time.time_ns()-base_time) / 1_000_000 
+            model_id = task.model_id
+            input_data = task.input_data
+            # put data into shared memory
+            shared_mem_lists[model_id][shared_mem_indexs[model_id]].copy_(input_data.squeeze(0))
+            shared_mem_indexs[model_id] += 1
+            buffer_queues[model_id].put(task)
 
-        ###### post processing (XXX this needs to be done here, if the manager() done, then queue are cleared) ######
-        all_results = {}
-        
-        for proc in range(num_proc):
-            results = {}
-            while not finish_queues[proc].empty():
-                task = finish_queues[proc].get()
-                # task = task_list[0]
-                results[str(task.tid)] = copy.deepcopy(task)
-            all_results[model_names[proc]] = results
-                
-        # print('collected totally', len(results.keys()), 'tasks')
+        # scheduling
+        scheduler.schedule()
+        # finish tasks from GPU
+        scheduler.finish_tasks_from_gpu()
 
-        # When you're ready to stop the workers, send None into the queue for each worker
-        for proc in range(num_proc): 
-            execute_queues[proc].put(None)
+        # this control the traffic arrival at real-world time
+        elapsed = time.perf_counter() - loop_start_time
+        if elapsed < sim_interval: # interval is 1 ms = 0.001 s
+            time.sleep(sim_interval - elapsed)
+        else:
+            print('.', end='', flush=True)
 
-        # Close and join the pool to wait for workers to finish
-        pool.close()
-        pool.join()
+    
+    # wait for tasks to complete
+    print('wait for 5 seconds...')
+    time.sleep(5)
+    # wait for empty execute queue
+    while True:
+        empty_all = True
+        for execute_queue in execute_queues:
+            empty_all = empty_all and execute_queue.empty()
+        if empty_all: break
+        print('wait for 1 more second...')
+        time.sleep(1)
 
-        print("All tasks processed and workers stopped.")
+    ###### post processing (XXX this needs to be done here, if the manager() done, then queue are cleared) ######
+    all_results = {}
+    
+    for proc in range(num_proc):
+        results = {}
+        while not finish_queues[proc].empty():
+            task = finish_queues[proc].get()
+            # task = task_list[0]
+            results[str(task.tk_id)] = copy.deepcopy(task)
+        all_results[model_names[proc]] = results
+            
+    # print('collected totally', len(results.keys()), 'tasks')
+
+    # When you're ready to stop the workers, send None into the queue for each worker
+    for proc in range(num_proc): 
+        execute_queues[proc].put(None)
+
+    # Close and join the pool to wait for workers to finish
+
+    print("All tasks processed and workers stopped.")
 
 
     pickle.dump(all_results, open(f'./heteo_result/results_batch_{args.intensity}_{num_proc}.pkl','wb'))

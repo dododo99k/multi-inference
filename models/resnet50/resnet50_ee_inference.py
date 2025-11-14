@@ -25,10 +25,11 @@ testloader = torch.utils.data.DataLoader(testset, batch_size=1, shuffle=False, n
 model = torch.load(work_dir+'/weights/resnet50_EE.pth')
 # cuda
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+model.eval()
 
 model.to(device)
 
-model.eval()
+
 
 # model
 total_time = 0

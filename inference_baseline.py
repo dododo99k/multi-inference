@@ -1,28 +1,62 @@
 import time,copy,os,pickle, argparse,json, subprocess
 import numpy as np
 import torch
-from torch.multiprocessing import Manager, Pool,current_process
+from torch.multiprocessing import Manager, Pool, Process, Barrier, Queue, current_process
 from torchvision import models
+import torch.multiprocessing as tmp
 
 
 # main process device
 device = torch.device('cpu')  # defer CUDA to child processes (MPS-friendly)
 
-def duplicate_model_dataset(model, dataset, num_proc):
-    models, datasets = [], []
-    for i in range(num_proc):
-        mdl = copy.deepcopy(model)
-        mdl.eval()
-        mdl.train_mode = False
-        models.append(mdl)
+def duplicate_model_dataset(model_lists, num_processes, batch_size):
+    data = torch.randn(batch_size, 3, 224, 224)  # keep on CPU; child will move to its own device
 
-        # keep tensors on CPU; child process will move to its own CUDA context
-        data = copy.deepcopy(dataset)
-        datasets.append(data)
+    if len(model_lists) >= 2:
+        print(f'Multi model mode: {model_lists}')
+        num_processes = len(model_lists)
+    elif len(model_lists) == 1:
+        print(f'Single model mode: {model_lists}')
+        model_lists = [model_lists[0] for _ in range(num_processes)]
+    
+    datasets = [data for _ in range(num_processes)]
+    model_lists_temp = []
+    for model_name in model_lists:
+        if model_name == 'resnet50':
+            weights = models.ResNet50_Weights.DEFAULT
+            model = models.resnet50(weights=weights)
+            model.eval()
+            model_lists_temp.append(model)
+        elif model_name == 'resnet101':
+            weights = models.ResNet101_Weights.DEFAULT
+            model = models.resnet101(weights=weights)
+            model.eval()
+            model_lists_temp.append(model)
+        elif model_name == 'resnet152':
+            weights = models.ResNet152_Weights.DEFAULT
+            model = models.resnet152(weights=weights)
+            model.eval()
+            model_lists_temp.append(model)
+        elif model_name == 'vgg11':
+            weights = models.VGG11_Weights.DEFAULT
+            model = models.vgg11(weights=weights)
+            model.eval()
+            model_lists_temp.append(model)
+        elif model_name == 'vgg16':
+            weights = models.VGG16_Weights.DEFAULT
+            model = models.vgg16(weights=weights)
+            model.eval()
+            model_lists_temp.append(model)
+        elif model_name == 'vgg19':
+            weights = models.VGG19_Weights.DEFAULT
+            model = models.vgg19(weights=weights)
+            model.eval()
+            model_lists_temp.append(model)
+        else:
+            raise ValueError('no implemented models')
+    return model_lists_temp, datasets, num_processes
 
-    return models, datasets
-
-def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0,
+def parallel_worker(model, data, idx_list, start_barrier, return_queue, warmup=0,
                     enable_compile=False, compile_mode='max-autotune'):
     # Child process: set device mapping for MPS. Expect CUDA_VISIBLE_DEVICES to be set externally (e.g., to '1').
     os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
@@ -35,6 +69,8 @@ def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0
     print(f'{current_process().name} using device {dev}')
     
     model = model.to(dev).eval()
+    results_list = []
+    # results_list.append({'worker': current_process().name})
 
     # Optionally compile the model for acceleration (PyTorch 2+)
     if enable_compile and hasattr(torch, 'compile'):
@@ -67,12 +103,12 @@ def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0
     worker_start_time = time.perf_counter()
     for idx in idx_list:
         with torch.no_grad():
+            torch.cuda.synchronize()
             start_time = time.perf_counter() - worker_start_time
             outputs = model(data)
-            if dev.type == 'cuda':
-                torch.cuda.synchronize()
-            outputs.detach().cpu()
+            torch.cuda.synchronize()
             end_time = time.perf_counter() - worker_start_time
+            outputs.detach().cpu()
             temp_records = {
                 'task_id': int(idx),
                 'worker': current_process().name,
@@ -81,6 +117,8 @@ def parallel_worker(model, data, results_list, idx_list, start_barrier, warmup=0
                 'duration': float(end_time - start_time),
             }
             results_list.append(temp_records)
+
+    return_queue.put(results_list)
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description=__doc__)
@@ -91,12 +129,13 @@ if __name__ == "__main__":
     
     argparser.add_argument('-l','--length',
                            type = int,
-                           default=3600,
+                           default=1200,
                            help='num of iterations')
     
     argparser.add_argument('-m','--model',
                            type = str,
-                           default='resnet50',
+                           default=['resnet50'],
+                           nargs='+',
                            help='[resnet50, resnet101, resnet152, vgg11, vgg16, vgg19]')
 
     argparser.add_argument('-i','--save',
@@ -130,7 +169,7 @@ if __name__ == "__main__":
     #                        help="torch.compile backend (e.g., 'inductor'); None uses default")
     
     args = argparser.parse_args()
-
+    args.no_compile = True
     # MPS-friendly setup (parent avoids touching CUDA; children will pick cuda:0 via remapping)
     os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
     os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')  # map physical GPU 0 to logical cuda:0 in children
@@ -146,66 +185,46 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.multiprocessing.set_start_method('spawn')
+    
+    ###########################################
 
-
-    if args.model == 'resnet50':
-        weights = models.ResNet50_Weights.DEFAULT
-        model = models.resnet50(weights=weights)
-    elif args.model == 'resnet101':
-        weights = models.ResNet101_Weights.DEFAULT
-        model = models.resnet101(weights=weights)
-    elif args.model == 'resnet152':
-        weights = models.ResNet152_Weights.DEFAULT
-        model = models.resnet152(weights=weights)
-    elif args.model == 'vgg11':
-        weights = models.VGG11_Weights.DEFAULT
-        model = models.vgg11(weights=weights)
-    elif args.model == 'vgg16':
-        weights = models.VGG16_Weights.DEFAULT
-        model = models.vgg16(weights=weights)
-    elif args.model == 'vgg19':
-        weights = models.VGG19_Weights.DEFAULT
-        model = models.vgg19(weights=weights)
-    else:
-        raise ValueError('no implemented models')
     
     #### test data ##############
-    data = torch.randn(args.batch, 3, 224, 224)  # keep on CPU; child will move to its own device
-    
-    models, datasets = duplicate_model_dataset(model, data, args.parallel)
 
+    model_lists, datasets, args.parallel = duplicate_model_dataset(args.model, args.parallel, args.batch)
+    print(f'Using {args.parallel} parallel workers for inference.')
     # model
     total_time = 0
     time_record = []
 
     # shared records across processes (per-worker)
-    manager = Manager()
-    pool = Pool(processes=args.parallel)
+    # manager = Manager()
+    # pool = Pool(processes=args.parallel)
     # Use manager-backed proxies so objects are pickleable under spawn
 
-    start_barrier = manager.Barrier(args.parallel+1)
+    start_barrier = Barrier(args.parallel+1)
+    result_q = Queue()
 
-    worker_records = [manager.list() for _ in range(args.parallel)]
+
+    # worker_records = [manager.list() for _ in range(args.parallel)]
 
     # partition indices across the number of parallel workers dynamically
     total_inference_index = list(range(args.length))
     group_inference_index = [total_inference_index[i::args.parallel] for i in range(args.parallel)]
 
-    # start worker processes
-    # Use explicit spawn context for both Pool and Barrier to avoid cross-context sync issues
-    # ctx =  torch.multiprocessing.get_context('spawn')
-    # pool = ctx.Pool(processes=args.parallel)
-    # barrier deprecated: using Event + counter instead
 
-    async_results = []
-    print(f'[DEBUG]: {args.no_compile}, {args.compile_mode}')
+    # start worker processes
+
+    torch_processes = []
     for i in range(args.parallel):
-        ar = pool.apply_async(
-            parallel_worker,
-            args=(models[i], datasets[i], worker_records[i], group_inference_index[i], start_barrier, args.warmup,
+        p = Process(
+            target=parallel_worker,
+            args=(model_lists[i], datasets[i], group_inference_index[i], start_barrier, result_q, args.warmup,
                   not args.no_compile, args.compile_mode),
+            name=f'Worker-{i}'
         )
-        async_results.append(ar)
+        p.start()
+        torch_processes.append(p)
 
 
     # Wait until all workers report readiness, then release together
@@ -217,13 +236,18 @@ if __name__ == "__main__":
         print(f'Error or timeout while waiting for workers to be ready: {e}')
 
     # Close and join the pool to wait for workers to finish
-    pool.close() 
-    for i, ar in enumerate(async_results):
-            try:
-                ar.get()
-            except Exception as e:
-                print(f"Worker {i} raised: {e}")
-    pool.join() 
+    # pool.close() 
+    # for i, ar in enumerate(async_results):
+    #         try:
+    #             ar.get()
+    #         except Exception as e:
+    #             print(f"Worker {i} raised: {e}")
+    # pool.join()
+    worker_records = [result_q.get(timeout=1200) for _ in range(args.parallel)]
+    for p in torch_processes:
+        p.join()
+    result_q.close()
+    result_q.join_thread()
 
     # Build time_record from merged per-worker task records
     try:
@@ -249,7 +273,8 @@ if __name__ == "__main__":
         std_ms = float(np.std(time_record) * 1000.0)
         print(f'average time: {mean_ms:.3f} ms, time std: {std_ms:.3f} ms')
 
-    save_name = f"{args.model}_parallel_{args.parallel}_batch_{args.batch}"
+    model_name_str = '_'.join(args.model) if len(args.model) > 1 else args.model[0]
+    save_name = f"{model_name_str}_parallel_{args.parallel}_batch_{args.batch}"
 
     # Persist results as JSON (metadata + summary + series + per-task records)
     if args.save:

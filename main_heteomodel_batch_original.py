@@ -83,6 +83,52 @@ def worker(execute_queue, finish_queue, model, dataset):
 
         finish_queue.put(task) # put it into the finish queue for stats and analysis later
 
+# Persistent worker function: Retrieves a task from the queue and processes it
+def batch_worker(execute_queue, finish_queue, model, dataset):
+    print(f"entered batch {current_process().name}. waiting for tasks...", flush=True)
+    data = dataset.to(device)
+    data = data.repeat(128, 1, 1, 1) # repeat this task, as all tasks are the same data
+
+    while True: 
+        # Blocking call, waits until an item is available in the queue
+        if_ending = False
+        count = 1
+        tasks = []
+
+        task = execute_queue.get() # Blocks indefinitely until a task is available
+        tasks.append(task)
+
+        while not execute_queue.empty():
+            task = execute_queue.get()
+            
+            # print(f'debug, task: {task.tid}, process: {current_process().name} ')
+            if task is None:  # None is the signal to stop the worker
+                if_ending = True
+                break
+            else:
+                tasks.append(task)
+                count += 1
+    
+        if if_ending or task is None: 
+            print(f"{current_process().name} received stop signal.")
+            break
+
+        for t in tasks: 
+            t.start_time = time.perf_counter()
+            t.batchsize = count # update its batchsize used during inference
+
+        outputs = model(data[:count])
+
+        outputs.detach().cpu()
+        # print(f"{current_process().name} process finish task: {task.tid}")
+        
+        for t in tasks:
+            t.finish_time = time.perf_counter()
+
+            t.finalize(if_print=False)
+
+            finish_queue.put(t) # put it into the finish queue for stats and analysis later
+
 
 def schedule(num_proc, buffer_queues, execute_queues):
     # this scheduling action happens for all time intervals, if not action needs to be done, then basically skip
@@ -95,6 +141,10 @@ def schedule(num_proc, buffer_queues, execute_queues):
             task = buffer_queues[proc].get()
             execute_queues[proc].put(task)
 
+
+#### TODO XXX
+#### increase the arrival interval, does not have to be 1ms granularity
+
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description=__doc__)
     argparser.add_argument('-s','--seed',
@@ -104,14 +154,19 @@ if __name__ == "__main__":
     
     argparser.add_argument('-pd','--intensity',
                            type = float,
-                           default=0.1,
+                           default=0.4,
                            help='poisson density for user inference request number per ms')
       
     argparser.add_argument('-l','--duration',
                            type = int,
                            default=30000,
                            help='time duration in ms')
-    
+         
+    argparser.add_argument('-b','--batch',
+                           type = bool,
+                           default=True,
+                           help='if using batch workers')
+        
     args = argparser.parse_args()
     
     np.random.seed(args.seed)
@@ -152,7 +207,10 @@ if __name__ == "__main__":
         
         # Start worker processes to process tasks in the queue
         for i in range(num_proc):
-            pool.apply_async(worker, args=(execute_queues[i], finish_queues[i], models[i], datasets[i])) # workers see execute_queue, not buffer_queue
+            if args.batch:
+                pool.apply_async(batch_worker, args=(execute_queues[i], finish_queues[i], models[i], datasets[i])) # workers see execute_queue, not buffer_queue
+            else:
+                pool.apply_async(worker, args=(execute_queues[i], finish_queues[i], models[i], datasets[i])) # workers see execute_queue, not buffer_queue
 
         # wait for workers to start
         print('waiting for workers to start...')
@@ -160,7 +218,10 @@ if __name__ == "__main__":
 
         start_time = time.perf_counter()
         print('starting the main loop...')
+        
+        #########################
         # main loop to receive tasks
+        #########################
         for t in range(args.duration):
             loop_start_time = time.perf_counter()
 
@@ -186,7 +247,8 @@ if __name__ == "__main__":
             if elapsed < 0.001: # interval is 1ms
                 time.sleep(0.001 - elapsed)
             else:
-                print('warning, time slot beyond defined unit, time is ', elapsed)
+                # print('warning, time slot beyond defined unit, time is ', elapsed)
+                print('.', end='', flush=True)
 
         
         # wait for tasks to complete
@@ -225,7 +287,7 @@ if __name__ == "__main__":
         print("All tasks processed and workers stopped.")
 
 
-    pickle.dump(all_results, open(f'./heteo_result/results_{args.intensity}_{num_proc}.pkl','wb'))
+    pickle.dump(all_results, open(f'./heteo_result/results_batch_{args.intensity}_{num_proc}.pkl','wb'))
     print('results are saved')
 
     # total_time = time.perf_counter() - start_time

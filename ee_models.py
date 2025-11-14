@@ -39,6 +39,22 @@ class earlyexit_ramp(nn.Module):
         x = self.flatten(x)
         x = self.fc(x)
         return x
+    
+class EarlyExitHead(nn.Module):
+    def __init__(self, in_ch, num_classes):
+        super().__init__()
+        mid = max(in_ch // 2, 64)
+        self.head = nn.Sequential(
+            nn.Conv2d(in_ch, mid, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(mid, num_classes),
+        )
+    def forward(self, x):
+        return self.head(x)
+    
 class EarlyExitResNet50(nn.Module):
     def __init__(self, original_model, num_class=1000):
         super(EarlyExitResNet50, self).__init__()
