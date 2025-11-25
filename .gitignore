@@ -1,7 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+
+# IDE / Editor
+.vscode/
+
+# Data, Models, and Archives
 **/weights/
-**/profile_results*/   # Ignore all profile directories
+dataset/
+*.pth
+*.zip
+*.tar.gz
+*.pkl
 
-
-*pth
+# Results, Logs, and Profiles
+**/profile_results*/
+heteo_result/
+homomodel_result/
+single_model_result/
 *ncu-rep
-*tar.gz
+*.log
+
+# Images and Notebooks
+# *.jpg
+# *.png
+*.ipynb
