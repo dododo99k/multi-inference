@@ -1,3 +1,7 @@
+import argparse
+import os,sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ee_models import *
 import time
 import torch
 import torchvision
@@ -22,205 +26,251 @@ def calculate_loss(exit_outputs, target):
         loss += loss_fn(output, target)
     return loss
 
-class earlyexit_ramp(nn.Module):
-    def __init__(self, num_feature=1024, num_classes =10):
-        super(earlyexit_ramp, self).__init__()
-        self.conv = nn.Conv2d(num_feature, int(num_feature/2), kernel_size=3, padding=1)
-        self.bn = nn.BatchNorm2d(int(num_feature/2))
-        self.relu = nn.ReLU(inplace=True)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.flatten = nn.Flatten()
-        self.fc = nn.Linear(int(num_feature/2), num_classes)
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        x = self.pool(x)
-        x = self.flatten(x)
-        x = self.fc(x)
-        return x
-
-class EarlyExitResNet50(nn.Module):
-    def __init__(self, original_model, num_class=1000):
-        super(EarlyExitResNet50, self).__init__()
-
-        # construct full model list
-        detail_layers = []
-
-        # construct early exit list in 
-        self.earlyest_point = -15
-        self.exit_list = range(self.earlyest_point,-3,1)
-
-        for i, child in enumerate(list(original_model.children())):
-            if len(list(child.children())) == 0:
-                # print(i, child)
-                detail_layers.append(child)
-            else: # 
-                for j, sub_child in enumerate(list(child.children())):
-                    # print(i,j, sub_child)
-                    # print('***********************************')
-                    detail_layers.append(sub_child)
-
-        self.features = nn.Sequential(*list(detail_layers[:-15])) # orginal top half model, from -2 to ....
-        self.next_layers = nn.ModuleList() # orginal later model layers, 12 items
-        self.exit_fcs = nn.ModuleList() # 13 items, not including full model exit
-
-        self.original_fc = nn.ModuleList()
-        self.original_fc.append(detail_layers[-3])
-        self.original_fc.append(detail_layers[-2])
-        self.original_fc.append(nn.Flatten(start_dim=1))
-        self.original_fc.append(detail_layers[-1])
-            
-        print('features output:', (check_features(self.features)))
-        self.exit_fcs.append(earlyexit_ramp(check_features(self.features), num_class)) # earlyest exit
 
 
-        for i in range(-15,-3,1): #[-15,-14,...,-3] 13 ramps
-            # tmp_layer = nn.Sequential(*list(detail_layers[i].children()))
-            tmp_layer = detail_layers[i]
-            self.next_layers.append(tmp_layer)
-            print(i,' next layers output:', (check_features(tmp_layer)))
-            for j, child in enumerate(list(tmp_layer.children())):
-                print(j,child)
-            print()
-            self.exit_fcs.append(earlyexit_ramp(check_features(tmp_layer), num_class))
-        
-        print('full model exit')
-        for j, child in enumerate(list(self.original_fc.modules())):
-            print(j,child)
-        # Freeze the features part
-        for param in self.features.parameters():
-            param.requires_grad = False
-        for layer in self.next_layers:
-            for param in layer.parameters():
-                param.requires_grad = False
-        for param in self.original_fc.parameters():
-            param.requires_grad = False
-        
-        print('middle layers number:', len(self.next_layers))
-        print('early exit ramps number:', len(self.exit_fcs))
-        
-    def forward(self, x, ramp = None):
-        x = self.features(x)
-        
-        if self.training:# training mode
-            early_exit_output = []
-            early_exit_output.append(self.exit_fcs[0](x))
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
-            for i,layer in enumerate(self.next_layers):
-                x = layer(x)
-                early_exit_output.append(self.exit_fcs[i+1](x))
-            
-        else: # inference mode
-            if type(ramp)==int: # early exit
-                # for layer in self.next_layers:
-                for i in range(ramp): # [-15,-14,-13,...,-2] -> [0,1,2,3,4,...] (ramps id)
-                    x = self.next_layers[i](x)
 
-                early_exit_output = self.exit_fcs[ramp](x)
+def build_imagenet_loaders(data_root, batch_size, val_batch_size, num_workers, pin_memory):
+    train_dir = os.path.join(data_root, 'train')
+    val_dir = os.path.join(data_root, 'val')
 
-            elif ramp == None: # full resnet model self.exit_list[-1]
-                for i in range(len(self.next_layers)):
-                    x = self.next_layers[i](x)
-                for i in range(len(self.original_fc)):
-                    x = self.original_fc[i](x)
-                    # print(x.size())
+    if not os.path.isdir(train_dir) or not os.path.isdir(val_dir):
+        raise FileNotFoundError(
+            f"ImageNet data not found under {data_root}. Expected 'train' and 'val' sub-directories.")
 
-                early_exit_output = x
-        
-        # Continue with the remaining layers
-        # main_exit_output = self.main_exit(x)
-        
-        return early_exit_output
-if __name__ == '__main__':
-    epoch_num = 300
-    # define data tansform function
-    weights = models.ResNet50_Weights.DEFAULT
-    transform = weights.transforms()
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
 
-    # load CIFAR-10
-    trainset = torchvision.datasets.CIFAR10(root='./dataset', train=True, download=True, transform=transform)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=100, shuffle=True, num_workers=16)
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
 
-    testset = torchvision.datasets.CIFAR10(root='./dataset', train=False, download=True, transform=transform)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=1000, shuffle=False, num_workers=16)
+    train_dataset = torchvision.datasets.ImageFolder(train_dir, transform=train_transform)
+    val_dataset = torchvision.datasets.ImageFolder(val_dir, transform=val_transform)
 
-    # define ResNet-50_cifar10
-    model = models.resnet50(weights=None)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=True,
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=val_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    num_classes = len(train_dataset.classes)
+    return train_loader, val_loader, num_classes
+
+
+def load_base_resnet50(base_model_path, use_pretrained, num_classes):
+    checkpoint_path = base_model_path
+    default_checkpoint = os.path.join('weights', 'resnet50.pth')
+    if checkpoint_path is None and os.path.isfile(default_checkpoint):
+        checkpoint_path = default_checkpoint
+
+    if checkpoint_path:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        if isinstance(checkpoint, nn.Module):
+            model = checkpoint
+        else:
+            model = models.resnet50(weights=None)
+            if isinstance(checkpoint, dict):
+                if 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                elif 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                else:
+                    state_dict = checkpoint
+            else:
+                state_dict = checkpoint
+
+            if isinstance(state_dict, dict):
+                state_dict = {k.replace('module.', '', 1) if k.startswith('module.') else k: v
+                              for k, v in state_dict.items()}
+            model.load_state_dict(state_dict)
+        print(f'Loaded base ResNet-50 weights from {checkpoint_path}')
+    else:
+        weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
+        model = models.resnet50(weights=weights)
+        if weights:
+            print('Initialized base ResNet-50 from torchvision pretrained weights.')
+        else:
+            print('Initialized base ResNet-50 with random weights.')
+
     num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, 10)  # CIFAR-10 has 10 classes
-    # load the original weights
-    model = torch.load('./weights/resnet50.pth', weights_only=False)
-    # define ee_model
-    num_classes = 10  # 根据你的任务更改类别数量
-    ee_model = EarlyExitResNet50(model, num_classes)
+    model.fc = nn.Linear(num_ftrs, num_classes)
+    return model
 
-    # cuda
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+def train_one_epoch(model, dataloader, optimizer, device, epoch, print_freq):
+    model.train()
+    running_loss = 0.0
+    window_loss = 0.0
+    epoch_start = time.perf_counter()
+    window_start = epoch_start
+    non_blocking = device.type == 'cuda'
+
+    for batch_idx, (inputs, targets) in enumerate(dataloader, 1):
+        inputs = inputs.to(device, non_blocking=non_blocking)
+        targets = targets.to(device, non_blocking=non_blocking)
+
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = calculate_loss(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        window_loss += loss.item()
+
+        if batch_idx % print_freq == 0:
+            elapsed = time.perf_counter() - window_start
+            print(f'[Epoch {epoch + 1}, Batch {batch_idx}] loss: {window_loss / print_freq:.3f}, '
+                  f'time for {print_freq} batches: {elapsed:.1f}s')
+            window_loss = 0.0
+            window_start = time.perf_counter()
+
+    epoch_time = time.perf_counter() - epoch_start
+    avg_loss = running_loss / max(len(dataloader), 1)
+    print(f'Epoch {epoch + 1} completed. Avg loss: {avg_loss:.4f}, epoch time: {epoch_time:.1f}s')
+
+
+def evaluate_early_exits(model, dataloader, device):
+    model.eval()
+    non_blocking = device.type == 'cuda'
+    accuracies = {}
+
+    with torch.no_grad():
+        for ramp_id in range(len(model.exit_fcs)):
+            correct = 0
+            total = 0
+            for images, labels in dataloader:
+                images = images.to(device, non_blocking=non_blocking)
+                labels = labels.to(device, non_blocking=non_blocking)
+                outputs = model(images, ramp_id)
+                if isinstance(outputs, (list, tuple)):
+                    outputs = outputs[0]
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+            accuracy = 100.0 * correct / total if total else 0.0
+            accuracies[f'exit_{ramp_id}'] = accuracy
+            print(f'Ramp id {ramp_id}: accuracy on validation set {accuracy:.2f}%')
+
+        correct = 0
+        total = 0
+        for images, labels in dataloader:
+            images = images.to(device, non_blocking=non_blocking)
+            labels = labels.to(device, non_blocking=non_blocking)
+            outputs = model(images, ramp=None)
+            if isinstance(outputs, (list, tuple)):
+                outputs = outputs[0]
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+        accuracy = 100.0 * correct / total if total else 0.0
+        accuracies['full'] = accuracy
+        print(f'Full ResNet-50 head accuracy (no early exit): {accuracy:.2f}%')
+
+    return accuracies
+
+
+def save_model(model, output_path):
+    model_dir = os.path.dirname(output_path)
+    if model_dir:
+        os.makedirs(model_dir, exist_ok=True)
+    torch.save(model, output_path)
+    print(f'Saved trained model to {output_path}')
+
+
+def main():
+    default_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    parser = argparse.ArgumentParser(description='Train the early-exit ResNet-50 on ImageNet.')
+    parser.add_argument('--imagenet-root', type=str, default='./dataset/imagenet',
+                        help='Root directory to ImageNet with train/ and val/ sub-directories.')
+    parser.add_argument('--epochs', type=int, default=90, help='Number of training epochs.')
+    parser.add_argument('--batch-size', type=int, default=256, help='Mini-batch size for training.')
+    parser.add_argument('--val-batch-size', type=int, default=256, help='Mini-batch size for validation.')
+    parser.add_argument('--workers', type=int, default=16, help='Number of dataloader worker processes.')
+    parser.add_argument('--lr', type=float, default=0.1, help='Learning rate for SGD.')
+    parser.add_argument('--momentum', type=float, default=0.9, help='Momentum for SGD.')
+    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for SGD.')
+    parser.add_argument('--step-size', type=int, default=30, help='StepLR step size.')
+    parser.add_argument('--gamma', type=float, default=0.1, help='StepLR gamma.')
+    parser.add_argument('--device', type=str, default=default_device,
+                        help='Device to use, e.g. cuda:0 or cpu. Defaults to first CUDA device if available.')
+    parser.add_argument('--base-model', type=str, default=None,
+                        help='Optional path to a ResNet-50 checkpoint used to build the early-exit model.')
+    parser.add_argument('--pretrained', dest='pretrained', action='store_true',
+                        help='Use torchvision pretrained weights when no checkpoint is provided (default).')
+    parser.add_argument('--no-pretrained', dest='pretrained', action='store_false',
+                        help='Do not load torchvision pretrained weights when no checkpoint is provided.')
+    parser.set_defaults(pretrained=True)
+    parser.add_argument('--output', type=str, default='./weights/resnet50_EE.pth',
+                        help='Where to store the trained early-exit model.')
+    parser.add_argument('--print-freq', type=int, default=100,
+                        help='How often (in iterations) to print training stats.')
+    args = parser.parse_args()
+    if args.device != 'cpu' and not torch.cuda.is_available():
+        print('CUDA requested but not available, falling back to CPU.')
+        device = torch.device('cpu')
+    else:
+        device = torch.device(args.device)
+
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+
+    pin_memory = device.type == 'cuda'
+    train_loader, val_loader, num_classes = build_imagenet_loaders(
+        args.imagenet_root,
+        args.batch_size,
+        args.val_batch_size,
+        args.workers,
+        pin_memory,
+    )
+
+    print(f'Loaded ImageNet data. Train samples: {len(train_loader.dataset)}, '
+          f'Val samples: {len(val_loader.dataset)}, Classes: {num_classes}')
+
+    base_model = load_base_resnet50(args.base_model, args.pretrained, num_classes)
+    ee_model = EarlyExitResNet50(base_model, num_classes)
     ee_model.to(device)
 
+    optimizer = optim.SGD(
+        filter(lambda p: p.requires_grad, ee_model.parameters()),
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
 
-    # loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(filter(lambda p: p.requires_grad, ee_model.parameters()), lr=0.001, momentum=0.9)
-
-    # optimizer = optim.SGD(ee_model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
-
-    # train
-    print('start training')
-    ee_model.train()
-    for epoch in range(epoch_num):
-        running_loss = 0.0
-        epoch_start_time = time.perf_counter()
-        record_time = time.perf_counter()
-        for i, data in enumerate(trainloader, 0):
-            # input
-            inputs, labels = data
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            # clear gradient
-            optimizer.zero_grad()
-
-            # forward
-            outputs_list = ee_model(inputs)
-            loss = calculate_loss(outputs_list, labels)
-            # loss = criterion(outputs, labels)
-            # back propagation
-            loss.backward()
-            # update weights
-            optimizer.step()
-
-            # print some information
-            running_loss += loss.item()
-            if i % 100 == 99:
-                time_length = time.perf_counter() - record_time
-                print(f'[Epoch {epoch + 1}, Batch {i + 1}] loss: {running_loss / 100:.3f}, time usage: {time_length}')
-                running_loss = 0.0
-                record_time = time.perf_counter()
-
-        print(f'Epoch {epoch + 1},loss:{running_loss}, time usage: {time.perf_counter() - epoch_start_time}')
-        # update learning rate
+    print(f'Start training for {args.epochs} epochs on {device}.')
+    for epoch in range(args.epochs):
+        train_one_epoch(ee_model, train_loader, optimizer, device, epoch, args.print_freq)
         scheduler.step()
 
     print('Finished Training')
+    evaluate_early_exits(ee_model, val_loader, device)
+    save_model(ee_model, args.output)
 
-    # validate
-    ee_model.eval()
-    ee_model.train_mode = False
-    correct = 0
-    total = 0
-    ramp_id = 0
-    with torch.no_grad():
-        for ramp_id in range(13):
-            for data in testloader:
-                images, labels = data
-                images, labels = images.to(device), labels.to(device)
-                outputs = ee_model(images, ramp_id)
-                _, predicted = torch.max(outputs[0].data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-            print(f'ramp id: {ramp_id}, Accuracy of the network on the 10000 test images: {100 * correct / total} %')
 
-    # save
-    torch.save(ee_model, './weights/resnet50_EE.pth')
+if __name__ == '__main__':
+    main()

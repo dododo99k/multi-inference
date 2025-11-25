@@ -4,24 +4,36 @@ import torch
 
 
 class Task():
-    def __init__(self, model_id=-1, tk_id=-1, arrive_time = -1, start_time = -1, finish_time = -1,):
+    def __init__(self, model_id=-1, tk_id=-1, arrive_time = -1, start_time = -1, finish_time = -1, slo = 100):
         # self.model_name = model_name
         self.model_id = model_id
         self.tk_id = tk_id
-        self.input_data = torch.randn(1, 3, 224, 224)
+        self.input_data = None#torch.randn(1, 3, 224, 224)
         self.result_data = None
+        self.slo = slo # in ms
+        self.ee_head = None
+        self.batch_meet_deadline = None  # whether the batch meets deadline
+        
+        self.base_time = None
         self.arrive_time = arrive_time
         self.start_time = start_time
         self.finish_time = finish_time
         self.infer_time = -1
         self.queue_time = -1
         self.batchsize = 1
+        
+        
 
     def finalize(self, if_print=True):
         self.infer_time = self.finish_time - self.start_time
         self.queue_time = self.start_time - self.arrive_time
         if if_print: print('infer time: ', self.infer_time, 'queue time: ', self.queue_time)
-        
+       
+       
+       
+       
+       
+############## Below code are not used in current version, for future extension ############## 
 import time
 from collections import deque
 from dataclasses import dataclass, field

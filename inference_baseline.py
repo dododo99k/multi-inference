@@ -27,6 +27,10 @@ def duplicate_model_dataset(model_lists, num_processes, batch_size):
             model = models.resnet50(weights=weights)
             model.eval()
             model_lists_temp.append(model)
+        elif model_name == 'resnet50ee':
+            model = torch.load('./weights/resnet50_EE.pth',map_location='cpu', weights_only=False)
+            model.eval()
+            model_lists_temp.append(model)
         elif model_name == 'resnet101':
             weights = models.ResNet101_Weights.DEFAULT
             model = models.resnet101(weights=weights)
@@ -56,8 +60,9 @@ def duplicate_model_dataset(model_lists, num_processes, batch_size):
             raise ValueError('no implemented models')
     return model_lists_temp, datasets, num_processes
 
-def parallel_worker(model, data, idx_list, start_barrier, return_queue, warmup=0,
+def parallel_worker(model, data, idx_list, start_barrier, return_queue, warmup=0, ee_head=0,
                     enable_compile=False, compile_mode='max-autotune'):
+    
     # Child process: set device mapping for MPS. Expect CUDA_VISIBLE_DEVICES to be set externally (e.g., to '1').
     os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
     # Robust device selection; fallback to CPU if CUDA is unavailable/problematic
@@ -66,7 +71,7 @@ def parallel_worker(model, data, idx_list, start_barrier, return_queue, warmup=0
         dev = torch.device('cuda:0')
     except Exception:
         dev = torch.device('cpu')
-    print(f'{current_process().name} using device {dev}')
+    print(f'{current_process().name} using device {dev}, if compiled: {enable_compile}')
     
     model = model.to(dev).eval()
     results_list = []
@@ -87,9 +92,11 @@ def parallel_worker(model, data, idx_list, start_barrier, return_queue, warmup=0
     if warmup > 0:
         with torch.no_grad():
             for _ in range(warmup):
-                _out = model(data)
-                if dev.type == 'cuda':
-                    torch.cuda.synchronize()
+                if type(ee_head) == int:
+                    _out = model(data,ee_head)
+                else:
+                    _out = model(data)                
+                torch.cuda.synchronize()
                 _ = _out.detach().cpu()
 
     # Mark readiness and wait for global start event
@@ -105,10 +112,13 @@ def parallel_worker(model, data, idx_list, start_barrier, return_queue, warmup=0
         with torch.no_grad():
             torch.cuda.synchronize()
             start_time = time.perf_counter() - worker_start_time
-            outputs = model(data)
+            if type(ee_head) == int:
+                _out = model(data,ee_head)
+            else:
+                _out = model(data) 
             torch.cuda.synchronize()
             end_time = time.perf_counter() - worker_start_time
-            outputs.detach().cpu()
+            _out.detach().cpu()
             temp_records = {
                 'task_id': int(idx),
                 'worker': current_process().name,
@@ -129,7 +139,7 @@ if __name__ == "__main__":
     
     argparser.add_argument('-l','--length',
                            type = int,
-                           default=1200,
+                           default=3600,
                            help='num of iterations')
     
     argparser.add_argument('-m','--model',
@@ -137,7 +147,12 @@ if __name__ == "__main__":
                            default=['resnet50'],
                            nargs='+',
                            help='[resnet50, resnet101, resnet152, vgg11, vgg16, vgg19]')
-
+    
+    argparser.add_argument('-e','--ee-head',
+                           type = int,
+                           default=0,
+                           help='if use ee head for resnet50')
+    
     argparser.add_argument('-i','--save',
                            type = bool,
                            default=True,
@@ -190,7 +205,8 @@ if __name__ == "__main__":
 
     
     #### test data ##############
-
+    if 'ee' not in args.model[0]:
+        args.ee_head = None
     model_lists, datasets, args.parallel = duplicate_model_dataset(args.model, args.parallel, args.batch)
     print(f'Using {args.parallel} parallel workers for inference.')
     # model
@@ -219,7 +235,7 @@ if __name__ == "__main__":
     for i in range(args.parallel):
         p = Process(
             target=parallel_worker,
-            args=(model_lists[i], datasets[i], group_inference_index[i], start_barrier, result_q, args.warmup,
+            args=(model_lists[i], datasets[i], group_inference_index[i], start_barrier, result_q, args.warmup, args.ee_head,
                   not args.no_compile, args.compile_mode),
             name=f'Worker-{i}'
         )
@@ -274,7 +290,10 @@ if __name__ == "__main__":
         print(f'average time: {mean_ms:.3f} ms, time std: {std_ms:.3f} ms')
 
     model_name_str = '_'.join(args.model) if len(args.model) > 1 else args.model[0]
-    save_name = f"{model_name_str}_parallel_{args.parallel}_batch_{args.batch}"
+    if args.ee_head is None:
+        save_name = f"{model_name_str}_parallel_{args.parallel}_batch_{args.batch}"
+    else:
+        save_name = f"{model_name_str}_parallel_{args.parallel}_batch_{args.batch}_eehead_{args.ee_head}"
 
     # Persist results as JSON (metadata + summary + series + per-task records)
     if args.save:
@@ -291,6 +310,7 @@ if __name__ == "__main__":
                 'backend': 'torch',
                 'compile': bool(not args.no_compile),
                 'compile_mode': args.compile_mode,
+                'ee_head': args.ee_head,
                 # 'compile_backend': args.compile_backend,
             },
             'summary': {
