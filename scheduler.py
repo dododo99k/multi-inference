@@ -78,7 +78,7 @@ class Scheduler():
         batch_size = len(self.buffer_queue)
         if self.permit.is_set(): # GPU worker is still busy
             return None
-        elif len(self.buffer_queue) > 0: # free GPU worker and has tasks in buffer
+        elif batch_size > 0: # free GPU worker and has tasks in buffer
             if self.executed_estimation == False: # not executed estimation yet, only do once when gpu is free
                 self.est_slot_num , self.est_batch_threshold, self.est_ee_head = self.estimate_slot_num_for_batch()
                 # print(f'[DEBUG] Poisson {self.poisson_intensity}, Estimated slot num: {self.est_slot_num}, estimated batch size threshold: {self.est_batch_threshold}, estimated ee head: {self.est_ee_head}')
@@ -87,28 +87,37 @@ class Scheduler():
             # print(f'[DEBUG] gap_time: {self.gap_time}, estimated batch time: {self.model_profile[batch_size][0]}')
             
             ##########
-            if len(self.buffer_queue) >= self.model_profile.shape[0]: # exceed max batch size
+            if batch_size >= self.model_profile.shape[0]: # exceed max batch size
                 self.ee_head.value = int(self.model_profile.shape[1]-1) # use earliest exit head
                 self.put_tasks_into_gpu(if_meet_deadline=False)
                 return None
             
-            if self.buffer_queue_earliest_ddl < float(self.time + self.gap_time) + self.model_profile[batch_size][0]: # exceed deadline
-                # decide to allocate tasks to GPU
-                # search ee_head to minimize deadline miss
-                for head in range(self.model_profile.shape[1]):
-                    if self.model_profile[batch_size][head] < self.buffer_queue_earliest_ddl - self.time:
-                        self.ee_head.value = head
-                        break
-                if self.ee_head.value == -1: # cant meet deadline even with full model
-                    self.ee_head.value = int(self.model_profile[batch_size][-1])  # use earliest exit head
-                self.put_tasks_into_gpu(if_meet_deadline=True)
-                return None
-                
-            elif False: # not meet deadline
-                if len(self.buffer_queue) >= self.est_batch_threshold:
-                    self.ee_head.value = self.est_ee_head
-                    self.put_tasks_into_gpu(if_meet_deadline=False)
-                    return
+            # put into gpu directly if gpu is free and tasks exist
+            for head in range(self.model_profile.shape[1]):
+                if self.model_profile[batch_size][head] < self.buffer_queue_earliest_ddl - self.time:
+                    self.ee_head.value = head
+                    break
+            if self.ee_head.value == -1: # cant meet deadline even with full model
+                self.ee_head.value = int(self.model_profile[batch_size][-1])  # use earliest exit head
+            self.put_tasks_into_gpu(if_meet_deadline=True)
+            return None
+        
+            # if self.buffer_queue_earliest_ddl < float(self.time + self.gap_time) + self.model_profile[batch_size][0]: # exceed deadline
+            #     # decide to allocate tasks to GPU
+            #     # search ee_head to minimize deadline miss
+            #     for head in range(self.model_profile.shape[1]):
+            #         if self.model_profile[batch_size][head] < self.buffer_queue_earliest_ddl - self.time:
+            #             self.ee_head.value = head
+            #             break
+            #     if self.ee_head.value == -1: # cant meet deadline even with full model
+            #         self.ee_head.value = int(self.model_profile[batch_size][-1])  # use earliest exit head
+            #     self.put_tasks_into_gpu(if_meet_deadline=True)
+            #     return None
+            # elif False: # not meet deadline
+            #     if batch_size >= self.est_batch_threshold:
+            #         self.ee_head.value = self.est_ee_head
+            #         self.put_tasks_into_gpu(if_meet_deadline=False)
+            #         return
             
 
 
