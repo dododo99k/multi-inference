@@ -24,4 +24,4 @@ single_model_result/
 # Images and Notebooks
 # *.jpg
 # *.png
-*.ipynb
+# *.ipynb

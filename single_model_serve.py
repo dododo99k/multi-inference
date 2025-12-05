@@ -5,11 +5,13 @@ import numpy as np
 import matplotlib
 matplotlib.use("agg")
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import torch
 from functions import Task, FastRollingWindow, InferenceRecord
 from ee_models import *
 from torchvision.io import read_image
 from torchvision.models import resnet50, ResNet50_Weights, resnet101, ResNet101_Weights, resnet152, ResNet152_Weights, vgg11, VGG11_Weights, vgg19, VGG19_Weights
+from scheduler import Scheduler
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -67,16 +69,17 @@ def batch_worker(model, execute_queue, permit, done, stop, shared_mem_list, data
         dev = torch.device('cpu')
     print(f'{current_process().name} using device {dev}')
     model = model.to(dev).eval()
-    random_data = torch.randn(30, 3, 224, 224).to(dev)
+    random_data = torch.randn(50, 3, 224, 224).to(dev)
     
     # warm up
-    for datasize in range(1, 31):
-        # data = shared_mem_list[:datasize].to(dev)
-        data = random_data[:datasize]
-        for i in range(5):
+    with torch.inference_mode():
+        for datasize in reversed(range(1, 51)):
             for ee in range(0, 14):
-                _ = model(data, ee)
-    print(f"batch {current_process().name} warmed up.", flush=True)
+                _ = model(random_data[:datasize],ee)
+                
+    # for ee in range(0, 14):
+    #     _ = model(random_data, ee)
+    print(f"[Worker] batch {current_process().name} warmed up.", flush=True)
     
     
     
@@ -84,6 +87,7 @@ def batch_worker(model, execute_queue, permit, done, stop, shared_mem_list, data
     while True:
         permit.wait()           # 阻塞等待许可（不占 CPU）
         if stop.is_set():          # 允许优雅收尾
+            print(f"[Worker] {current_process().name} received stop signal. Exiting.")
             break
         receive_time_temp = time.time_ns()
         # print(f"{current_process().name}, shared memory pointer {data_number.value}, ee_head {ee_head.value}")
@@ -95,7 +99,9 @@ def batch_worker(model, execute_queue, permit, done, stop, shared_mem_list, data
         data = random_data[:data_number.value]
         
         start_time_temp = time.time_ns()
-        results = model(data, int(ee_head.value))  # 批处理推理
+        _ee_head = int(ee_head.value)
+        # print(f'[Worker debug] start inference batch size {data.size(0)}, ee_head \033[31m{_ee_head}\033[0m')
+        results = model(data, _ee_head)  # 批处理推理
         
         torch.cuda.synchronize()  # 确保推理完成
         finish_time_temp = time.time_ns()
@@ -107,6 +113,7 @@ def batch_worker(model, execute_queue, permit, done, stop, shared_mem_list, data
                 task = execute_queue.get_nowait()
             except queue.Empty:
                 break
+            task.ee_head = _ee_head
             task.start_time = (start_time_temp - task.base_time) / 1_000_000
             task.finish_time = (finish_time_temp - task.base_time) / 1_000_000
             tmp.append(task)
@@ -119,213 +126,6 @@ def batch_worker(model, execute_queue, permit, done, stop, shared_mem_list, data
         # Disable print to avoid I/O blocking that causes ~70ms delay
         # print(f"{current_process().name} finished processing batch of size {len(tmp)}, time: {(time.time_ns() - receive_time_temp) / 1_000_000} ms, inference time: {(finish_time_temp - start_time_temp) / 1_000_000} ms.")
 
-
-# Scheduler with history info
-class Scheduler():
-    def __init__(self, num_proc, buffer_queue, execute_queue, finish_queue, shared_mem_list, shared_mem_index, permit, done, stop, model_profile, ee_head):
-        self.num_proc = num_proc
-        self.buffer_queue = buffer_queue
-        self.execute_queue = execute_queue
-        self.finish_queue = finish_queue
-        self.shared_mem_list = shared_mem_list
-        self.shared_mem_index = shared_mem_index
-        ########################
-        self.buffer_queue_1st_arrive_time = None # earliest arrive time in the buffer queue (batch)
-        self.buffer_queue_earliest_ddl = None # earliest ddl in the buffer queue (batch)
-        self.single_model_id = 0 # only serve single model
-        
-        ######## some synchronization variables ########
-        self.permit = permit
-        self.done = done
-        self.stop = stop
-        # self.finish_times = finish_times
-        
-        # model profile for scheduling decision
-        # 2 diemension array: model_profile[batch size+1][early exit head] = inference time
-        # +1 because batch size from 0 to N
-        self.model_profile = model_profile
-        self.ee_head = ee_head
-        self.gap_time = 15 # ms
-        self.poisson_intensity = 0.0 # estimated poisson intensity for task arrival
-        self.poisson_distribution = []
-        
-        self.time = 0
-        self.buffer_history = []
-        self.last_time_slot_buffer_size = 0
-        self.executed_estimation = False
-
-    def simple_schedule(self):
-        self.time += 1
-        for proc in range(self.num_proc): # for each proc
-            if len(self.buffer_queues[proc]) == 0:
-                pass
-            else:
-                task = self.buffer_queues[proc].popleft()
-                self.execute_queues[proc].append(task)
-
-    def schedule(self): # single model scheduling
-        # this scheduling action happens for all time intervals, if not action needs to be done, then basically skip
-        start_time = time.perf_counter_ns()
-        self.time += 1
-        
-        # Store how many tasks arrived in this time slot
-        if len(self.buffer_queue) > 0 and len(self.buffer_queue) - self.last_time_slot_buffer_size >= 0:
-            self.buffer_history.append(len(self.buffer_queue) - self.last_time_slot_buffer_size)
-        elif self.last_time_slot_buffer_size > len(self.buffer_queue):
-            self.buffer_history.append(len(self.buffer_queue))
-        else: # no task arrived
-            self.buffer_history.append(0)
-        self.last_time_slot_buffer_size = len(self.buffer_queue)
-        
-        # Set earliest ddl for current batch if not set
-        if self.buffer_queue_earliest_ddl is None and self.buffer_queue:
-            _first_task = self.buffer_queue.popleft()
-            self.buffer_queue_1st_arrive_time = _first_task.arrive_time
-            self.buffer_queue_earliest_ddl =  _first_task.arrive_time + _first_task.slo # just get the first task's slo as the earliest ddl
-            self.buffer_queue.appendleft(_first_task)
-            print(f'[Set DDL] time \033[34m{self.time}\033[0m ms, Updated earliest ddl: {self.buffer_queue_earliest_ddl} ms, first arrive time: {self.buffer_queue_1st_arrive_time} ms')
-            
-            
-        batch_size = len(self.buffer_queue)
-        if self.permit.is_set(): # GPU worker is still busy
-            return None
-        elif len(self.buffer_queue) > 0: # free GPU worker and has tasks in buffer
-            if self.executed_estimation == False: # not executed estimation yet, only do once when gpu is free
-                self.est_slot_num , self.est_batch_threshold, self.est_ee_head = self.estimate_slot_num_for_batch()
-                # print(f'[DEBUG] Poisson {self.poisson_intensity}, Estimated slot num: {self.est_slot_num}, estimated batch size threshold: {self.est_batch_threshold}, estimated ee head: {self.est_ee_head}')
-
-            # print(f'[DEBUG] time {self.time} ms, buffer size: {len(self.buffer_queue)}, earliest ddl: {self.buffer_queue_earliest_ddl}')
-            # print(f'[DEBUG] gap_time: {self.gap_time}, estimated batch time: {self.model_profile[batch_size][0]}')
-            
-            ##########
-            if len(self.buffer_queue) >= self.model_profile.shape[0]: # exceed max batch size
-                self.ee_head.value = int(self.model_profile.shape[1]-1) # use earliest exit head
-                self.put_tasks_into_gpu(if_meet_deadline=False)
-                return None
-            
-            if self.buffer_queue_earliest_ddl < float(self.time + self.gap_time) + self.model_profile[batch_size][0]: # exceed deadline
-                # decide to allocate tasks to GPU
-                # search ee_head to minimize deadline miss
-                for head in range(self.model_profile.shape[1]):
-                    if self.model_profile[batch_size][head] < self.buffer_queue_earliest_ddl - self.time:
-                        self.ee_head.value = head
-                        break
-                if self.ee_head.value == -1: # cant meet deadline even with full model
-                    self.ee_head.value = int(self.model_profile[batch_size][-1])  # use earliest exit head
-                self.put_tasks_into_gpu(if_meet_deadline=True)
-                return None
-                
-            elif False: # not meet deadline
-                if len(self.buffer_queue) >= self.est_batch_threshold:
-                    self.ee_head.value = self.est_ee_head
-                    self.put_tasks_into_gpu(if_meet_deadline=False)
-                    return
-            
-
-
-    def put_tasks_into_gpu(self, if_meet_deadline=True):
-        buffer_queue_size = len(self.buffer_queue)
-        self.shared_mem_index.value = len(self.buffer_queue) # set shared memory index
-        while not len(self.buffer_queue) == 0:
-            task = self.buffer_queue.popleft()
-            task.batch_meet_deadline = if_meet_deadline
-            # put data into shared memory
-            # self.shared_mem_list[self.shared_mem_index.value].copy_(task.input_data.squeeze(0))
-            # self.shared_mem_index.value += 1
-            self.execute_queue.put(task)
-            
-        self.permit.set()  # notify the worker to start processing
-        try:
-            print(f'[Execute] time \033[34m{self.time}\033[0m ms, scheduled \033[34m{buffer_queue_size}\033[0m tasks to GPU, ee head: \033[32m{self.ee_head.value}\033[0m,with run time {self.model_profile[buffer_queue_size][self.ee_head.value]} meet deadline: {if_meet_deadline}')
-        except Exception as e:
-            print(f'[Execute] time \033[34m{self.time}\033[0m ms, scheduled Extra Large batch of \033[31m{buffer_queue_size}\033[0m tasks to GPU, ee head: \033[32m{self.ee_head.value}\033[0m, meet deadline: {if_meet_deadline}')
-        self.buffer_queue_earliest_ddl = None
-        self.buffer_queue_1st_arrive_time = None
-        self.last_time_slot_buffer_size = 0
-        self.done.clear()
-    
-    def finish_tasks_from_gpu(self):
-        # see which model has finished its batch processing
-        # Non-blocking check: only process if GPU is done, otherwise skip immediately
-        if not self.done.is_set():
-            return  # GPU still busy, skip
-        
-        self.shared_mem_index.value = 0 # reset shared memory index
-        self.ee_head.value = -1 # set to default
-        
-        # Optimized: collect all tasks first, then append in batch
-        tasks_to_finish = []
-        while True:
-            try:
-                task = self.execute_queue.get_nowait()
-                tasks_to_finish.append(task)
-            except queue.Empty:
-                break
-        
-        # Batch append to finish_queue
-        self.finish_queue.extend(tasks_to_finish)
-        
-        self.executed_estimation = False # reset estimation flag for next scheduling round
-
-    def stop_all(self):
-        self.permit.set()
-        self.stop.set()
-    
-    def estimate_poisson_intensity(self):
-        window_length = min(1000, len(self.buffer_history))
-        self.poisson_intensity = np.mean(self.buffer_history[-window_length:])
-
-    def get_poisson_distribution(self, k_max=None):
-        if k_max is None:
-            k_max = int(self.poisson_intensity + 5 * self.poisson_intensity**0.5)
-        ks = np.arange(0, k_max + 1)
-        self.poisson_distribution = np.exp(-self.poisson_intensity) * np.power(self.poisson_intensity, ks) / np.array([math.factorial(k) for k in ks])
-        if len(self.poisson_distribution) > self.model_profile.shape[0]:
-            self.poisson_distribution = self.poisson_distribution[:self.model_profile.shape[0]]
-        
-    def get_n_slot_estimate_batch_size(self, slot_num):
-        delta_t = 1.0 # ms
-        lam_tot = self.poisson_intensity * delta_t * slot_num
-        k_max = int(lam_tot + 5 * math.sqrt(lam_tot))
-        ks = np.arange(0, k_max + 1)
-        _distribution = np.exp(-lam_tot) * lam_tot**ks / np.array([math.factorial(k) for k in ks]) # event number distribution in n slots
-        # if len(_distribution) > self.model_profile.shape[0]:
-        #     _distribution = _distribution[:self.model_profile.shape[0]]
-        return _distribution
-
-        
-    def estimate_slot_num_for_batch(self):
-        # estimate how many time slots are needed to accumulate target_batch_size tasks
-        self.executed_estimation = True
-        self.estimate_poisson_intensity()
-        self.get_poisson_distribution()
-        # print(f'[DEBUG] estimated poisson intensity: {self.poisson_intensity} tasks/ms')
-        if self.poisson_intensity == 0:
-            return None, None, None
-        # look for a slot num that can accumulate target_batch_size tasks
-        # meet the inference time of xx batch size in n-slot == the buffer waiting time of slot num
-        est_inference_time = 0.0
-        for i , prob in enumerate(self.poisson_distribution):
-            est_inference_time += prob * self.model_profile[i][0]
-        
-        # n_slot_batch_est_inference_time = 0.0
-        for _ee_head in range(self.model_profile.shape[1]): # ee head
-            for slot_num in range(1,30+1): # max time slots
-                n_slot_batch_est_inference_time = 0.0
-                n_slot_batch_size_distribution = self.get_n_slot_estimate_batch_size(slot_num)
-                if len(n_slot_batch_size_distribution) > self.model_profile.shape[0]:
-                    left_distribution_sum = np.sum(n_slot_batch_size_distribution[self.model_profile.shape[0]:])
-                    if left_distribution_sum > 0.1: # too much mass left
-                        break
-                    n_slot_batch_size_distribution = n_slot_batch_size_distribution[:self.model_profile.shape[0]]
-                # search for estimated inference time
-                for i , prob in enumerate(n_slot_batch_size_distribution):
-                    n_slot_batch_est_inference_time += prob * self.model_profile[i][_ee_head]
-                if n_slot_batch_est_inference_time <= slot_num:
-                    return slot_num, math.ceil(slot_num * self.poisson_intensity), _ee_head
-
-        return None, None, None
-    
 
 
 
@@ -467,10 +267,10 @@ if __name__ == "__main__":
         else:
             print(f'[WARNING!!!!!!!], {t} ms')
             
-    time.sleep(5)
     for t in range(1000): # extra 1000 ms to process remaining tasks
         loop_start_time = time.perf_counter()
         scheduler.finish_tasks_from_gpu()
+        scheduler.schedule()
         # this control the traffic arrival at real-world time
         elapsed = time.perf_counter() - loop_start_time
         if elapsed < sim_interval: # interval is 1 ms = 0.001 s
@@ -495,11 +295,19 @@ if __name__ == "__main__":
     
     ###### post processing (XXX this needs to be done here, if the manager() done, then queue are cleared) ######
     all_results = {}
-    
+    total_time_list = []
+    queue_time_list = []
+    infer_time_list = []
+    ee_heads_list = []
     for proc in range(num_proc):
         results = {}
         while len(finish_queues[proc]) > 0:
             task = finish_queues[proc].popleft()
+            
+            total_time_list.append(task.total_time)
+            queue_time_list.append(task.queue_time)
+            infer_time_list.append(task.infer_time)
+            ee_heads_list.append(task.ee_head)
             # task = task_list[0]
             results[str(task.tk_id)] = copy.deepcopy(task)
         all_results[model_name] = results
@@ -519,4 +327,53 @@ if __name__ == "__main__":
 
     print('results are saved')
     print('total tasks number in scheduler buffer history:', sum(scheduler.buffer_history))
+    # draw total time CDF and total time series
+    sorted_total_time = np.sort(np.array(total_time_list))
+    sorted_queue_time = np.sort(np.array(queue_time_list))
+    sorted_infer_time = np.sort(np.array(infer_time_list))
+    sorted_ee_heads = np.sort(np.array(ee_heads_list))
+    plt.figure(figsize=(18,10))
+    outer_gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.3)
+    top_gs = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=outer_gs[0], wspace=0.25)
+    bottom_gs = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=outer_gs[1], width_ratios=[1, 2], wspace=0.3)
+    
+    ax0 = plt.subplot(top_gs[0])
+    ax0.plot(sorted_total_time, np.arange(len(sorted_total_time))/len(sorted_total_time), marker='o', markersize=2)
+    ax0.set_xlabel('Total Time (ms)')
+    ax0.set_ylabel('CDF')
+    ax0.set_title('CDF of Total Time, Poisson Intensity: '+str(args.intensity))
+    ax0.grid(True)
+
+    ax1 = plt.subplot(top_gs[1])
+    ax1.plot(sorted_queue_time, np.arange(len(sorted_queue_time))/len(sorted_queue_time), marker='o', markersize=2)
+    ax1.set_xlabel('Queue Time (ms)')
+    ax1.set_ylabel('CDF')
+    ax1.set_title('CDF of Queue Time')
+    ax1.grid(True)
+
+    ax2 = plt.subplot(top_gs[2])
+    ax2.plot(sorted_infer_time, np.arange(len(sorted_infer_time))/len(sorted_infer_time), marker='o', markersize=2)
+    ax2.set_xlabel('Inference Time (ms)')
+    ax2.set_ylabel('CDF')
+    ax2.set_title('CDF of Inference Time')
+    ax2.grid(True)
+
+    ax3 = plt.subplot(bottom_gs[0])
+    ax3.plot(sorted_ee_heads, np.arange(len(sorted_ee_heads))/len(sorted_ee_heads), marker='o', markersize=2)
+    ax3.set_xlabel('EE Head')
+    ax3.set_ylabel('CDF')
+    ax3.set_title('CDF of EE Head')
+    ax3.grid(True)
+    
+    ax4 = plt.subplot(bottom_gs[1])
+    ax4.plot(np.arange(len(total_time_list)), total_time_list, marker='o', markersize=2)
+    ax4.set_xlabel('Task Index (sorted)')
+    ax4.set_ylabel('Total Time (ms)')
+    ax4.set_title('Total Time Series, Poisson Intensity: '+str(args.intensity))
+    ax4.grid(True)
+    
+    
+     
+    plt.tight_layout()
+    plt.savefig(f'./single_model_result/total_time_cdf_intensity_{args.intensity}.png')
     

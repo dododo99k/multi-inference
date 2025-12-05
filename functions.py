@@ -20,14 +20,18 @@ class Task():
         self.finish_time = finish_time
         self.infer_time = -1
         self.queue_time = -1
+        self.total_time = -1
+        self.total_time = -1
         self.batchsize = 1
+        self.batch_id = -1
         
         
 
     def finalize(self, if_print=True):
         self.infer_time = self.finish_time - self.start_time
         self.queue_time = self.start_time - self.arrive_time
-        if if_print: print('infer time: ', self.infer_time, 'queue time: ', self.queue_time)
+        self.total_time = self.finish_time - self.arrive_time
+        if if_print: print('infer time: ', self.infer_time, 'queue time: ', self.queue_time, 'total time: ', self.total_time)
        
        
        

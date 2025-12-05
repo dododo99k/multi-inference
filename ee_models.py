@@ -41,7 +41,7 @@ class earlyexit_ramp(nn.Module):
         # self.fc = nn.Linear(int(num_feature/2), num_classes)
     def forward(self, x):
         return self.head(x)
-    
+
 class EarlyExitHead(nn.Module):
     def __init__(self, in_ch, num_classes):
         super().__init__()
